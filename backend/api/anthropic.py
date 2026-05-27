@@ -357,13 +357,14 @@ async def anthropic_messages(request: Request):
                             if not stream_state.pending_chunks:
                                 stream_state.pending_chunks.append(_message_start_event(msg_id, model_name, current_prompt, execution.state.answer_text))
 
-                            stream_state.close_current_block()
+                            #stream_state.close_current_block()
                             directive = build_tool_directive(standard_request, execution.state)
                             if directive.stop_reason == "tool_use":
                                 stream_state.clear_answer_text()
                                 stream_state.current_block = {"type": None, "index": None, "tool_call_id": None}
                             else:
                                 stream_state.flush_answer_text()
+                                stream_state.close_current_block()
                             expected_tool_ids = {
                                 block.get("id")
                                 for block in directive.tool_blocks
