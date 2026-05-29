@@ -1006,17 +1006,22 @@ def evaluate_retry_directive(
                     inject_assistant_message(current_prompt, force_text),
                 )
 
-    # 空响应重试：上游返回 answer_chars=0 tool_calls=0 finish_reason=stop
-    # 典型场景是 Qwen 后端对某个 chat_id 返回空（常见于池化 chat_id 刚建好就被用、
-    # 或 Qwen 服务抖动时）。换账号 + 换新 chat_id 再试一次。
+    # 空响应重试：上游返回 answer_chars=0 tool_calls=0 finish_reason=stop。
+    # 典型场景：
+    # 1) Qwen 后端对某个 chat_id 直接返回空；
+    # 2) 只返回了 thinking/reasoning，但没有最终 answer。
+    # 这两种情况对 OpenAI 兼容层都会变成 message.content=""，容易让 agent 中断。
+    # 允许在“只有 reasoning、没有最终正文”时继续自动重试，而不是把空结果当成功。
+    answer_text = state.answer_text.strip()
+    reasoning_text = state.reasoning_text.strip()
     if (
-        not state.answer_text
+        not answer_text
         and not state.tool_calls
         and state.finish_reason == "stop"
-        and not state.emitted_visible_output
+        and can_retry_after_output
     ):
         return _retry(
-            "empty_upstream_response",
+            "reasoning_only_upstream_response" if reasoning_text else "empty_upstream_response",
             current_prompt,  # prompt 不变，让上游重新处理
         )
 
