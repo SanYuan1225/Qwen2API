@@ -4,7 +4,9 @@
 FROM --platform=$BUILDPLATFORM node:20-bookworm-slim AS frontend-builder
 WORKDIR /app
 COPY frontend/package*.json ./
-RUN npm ci
+# Prefer deterministic install; fall back to npm install when lockfile is out of sync
+# (e.g. transitive optional deps like @emnapi/* differ across npm/OS environments).
+RUN npm ci --no-audit --fund=false || npm install --no-audit --fund=false
 COPY frontend/ ./
 RUN npm run build
 
