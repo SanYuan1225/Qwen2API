@@ -111,6 +111,8 @@ class QwenExecutor:
         first_event_logged = False
         last_chunk_time = time.perf_counter()
         total_output_chars = 0  # 方案4：统计输出字符数
+        total_delta_events = 0
+        total_delta_content_chars = 0
 
         feature_config = payload.get("messages", [{}])[0].get("feature_config", {})
         prompt_len = len(content)
@@ -140,6 +142,8 @@ class QwenExecutor:
                     while "\n\n" in buffer:
                         msg, buffer = buffer.split("\n\n", 1)
                         for evt in parse_sse_chunk(msg):
+                            total_delta_events += 1
+                            total_delta_content_chars += len(str(evt.get("content") or ""))
                             if not first_event_logged:
                                 first_event_logged = True
                                 log.info(
@@ -158,6 +162,8 @@ class QwenExecutor:
 
         if buffer:
             for evt in parse_sse_chunk(buffer):
+                total_delta_events += 1
+                total_delta_content_chars += len(str(evt.get("content") or ""))
                 if not first_event_logged:
                     first_event_logged = True
                     log.info(
@@ -166,6 +172,13 @@ class QwenExecutor:
                 yield evt
 
         elapsed = time.perf_counter() - started_at
+        if total_delta_content_chars == 0:
+            log.warning(
+                f"[上游] 空内容流 会话={chat_id} 总耗时={elapsed:.3f}s "
+                f"SSE字节={total_output_chars} delta事件={total_delta_events} — 切换账号重试"
+            )
+            raise Exception("Upstream empty stream: no delta content")
+
         # 检测异常短回复（通常是上游超时的信号）
         if has_custom_tools and total_output_chars < 20 and elapsed > 5.0:
             log.warning(f"[上游] 异常短回复 仅 {total_output_chars} 字符 耗时 {elapsed:.1f}s — 疑似上游超时")
@@ -181,8 +194,13 @@ class QwenExecutor:
         files: list[dict] | None = None,
         fixed_account=None,
         existing_chat_id: str | None = None,
+        exclude_account_emails: list[str] | None = None,
     ):
-        exclude = set()
+        exclude = set(exclude_account_emails or [])
+        if fixed_account is not None and getattr(fixed_account, "email", None) in exclude and not existing_chat_id and not files:
+            log.warning(f"[上游] 指定账号在排除列表中，改用其他账号 账号={fixed_account.email}")
+            fixed_account = None
+
         if fixed_account is not None:
             update_request_context(upstream_attempt=1)
             acc = fixed_account
@@ -198,9 +216,12 @@ class QwenExecutor:
                 async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
                     yield {"type": "event", "event": evt}
                 return
-            except Exception:
+            except Exception as e:
                 self.account_pool.release(acc)
-                raise
+                if existing_chat_id or files:
+                    raise
+                exclude.add(acc.email)
+                log.warning(f"[上游] 指定账号失败，切换账号重试 账号={acc.email} 错误={e}")
 
         for attempt in range(settings.MAX_RETRIES):
             update_request_context(upstream_attempt=attempt + 1)

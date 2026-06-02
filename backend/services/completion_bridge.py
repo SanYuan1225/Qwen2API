@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from backend.adapter.standard_request import StandardRequest
-from backend.runtime.execution import build_tool_directive, cleanup_runtime_resources, collect_completion_run, evaluate_retry_directive
+from backend.runtime.execution import build_tool_directive, cleanup_runtime_resources, collect_completion_run, empty_upstream_response_reason, evaluate_retry_directive
 from backend.services.auth_quota import add_used_tokens
 from backend.services.task_session import build_retry_rebase_prompt
 from backend.services.token_calc import calculate_usage
@@ -25,6 +25,28 @@ async def _reacquire_bound_account_if_needed(*, client, standard_request: Standa
     if preferred_email:
         standard_request.bound_account = await client.account_pool.acquire_wait_preferred(preferred_email, timeout=60)
     else:
+        standard_request.bound_account = None
+
+
+def _exclude_attempt_account_for_empty_retry(*, standard_request: StandardRequest, execution: Any, reason: str | None) -> None:
+    if reason not in {"empty_upstream_response", "reasoning_only_upstream_response"}:
+        return
+    # File refs and persistent chat ids are account-scoped upstream resources; switching accounts
+    # without re-uploading/rebasing would break that request, so only force switch for plain chats.
+    if getattr(standard_request, "upstream_files", None) or getattr(standard_request, "upstream_chat_id", None):
+        return
+    email = getattr(getattr(execution, "acc", None), "email", None)
+    if not email:
+        return
+    excluded = getattr(standard_request, "excluded_account_emails", None)
+    if excluded is None:
+        excluded = []
+        standard_request.excluded_account_emails = excluded
+    if email not in excluded:
+        excluded.append(email)
+    if getattr(standard_request, "bound_account_email", None) == email:
+        standard_request.bound_account_email = None
+    if getattr(getattr(standard_request, "bound_account", None), "email", None) == email:
         standard_request.bound_account = None
 
 
@@ -93,6 +115,11 @@ async def run_retryable_completion_bridge(
             allow_after_visible_output=allow_after_visible_output,
         )
         if retry.retry:
+            _exclude_attempt_account_for_empty_retry(
+                standard_request=standard_request,
+                execution=execution,
+                reason=retry.reason,
+            )
             preserve_chat = bool(getattr(standard_request, 'persistent_session', False))
             await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=preserve_chat)
 
@@ -106,6 +133,19 @@ async def run_retryable_completion_bridge(
                 await asyncio.sleep(0.15)
             await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
             continue
+
+        empty_reason = empty_upstream_response_reason(execution.state)
+        if empty_reason:
+            await cleanup_runtime_resources(
+                client,
+                execution.acc,
+                execution.chat_id,
+                preserve_chat=bool(getattr(standard_request, 'persistent_session', False)),
+            )
+            raise RuntimeError(
+                f"Upstream returned an empty response after {attempt_index + 1}/{max_attempts} attempts "
+                f"({empty_reason}). Please retry later or check upstream account/model health."
+            )
 
         usage = calculate_usage(current_prompt, execution.state.answer_text)
         usage_delta = usage_delta_factory(execution, current_prompt) if usage_delta_factory is not None else usage["total_tokens"]

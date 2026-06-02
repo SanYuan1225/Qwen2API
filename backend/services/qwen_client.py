@@ -191,6 +191,7 @@ class QwenClient:
         files: list[dict] | None = None,
         fixed_account=None,
         existing_chat_id: str | None = None,
+        exclude_account_emails: list[str] | None = None,
     ):
         async for item in self.executor.chat_stream_events_with_retry(
             model,
@@ -199,5 +200,6 @@ class QwenClient:
             files=files,
             fixed_account=fixed_account,
             existing_chat_id=existing_chat_id,
+            exclude_account_emails=exclude_account_emails,
         ):
             yield item

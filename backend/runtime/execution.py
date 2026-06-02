@@ -137,6 +137,7 @@ __all__ = [
     "collect_completion_run",
     "collect_completion_run_with_recovery",
     "continue_after_retry_directive",
+    "empty_upstream_response_reason",
     "evaluate_retry_directive",
     "extract_blocked_tool_names",
     "finalize_anthropic_stream_success",
@@ -446,12 +447,13 @@ async def collect_completion_run(
                     len(answer_text),
                 )
 
-        # 检查空输出
-        if not detected_tool_calls and not answer_text.strip() and not reasoning_text.strip():
+        # 检查空输出 / 只有 reasoning 没有最终 answer
+        if not detected_tool_calls and not answer_text.strip():
             log.warning(
-                "[收集完成] 上游返回空输出: 原因=%s 会话=%s",
+                "[收集完成] 上游返回无最终答复: 原因=%s 会话=%s 推理字数=%s",
                 reason,
                 chat_id,
+                len(reasoning_text),
             )
             # 如果有 reasoning 但没有 visible output，说明模型只输出了思考过程
             if reasoning_text.strip():
@@ -495,6 +497,7 @@ async def collect_completion_run(
         files=getattr(request, "upstream_files", None),
         fixed_account=getattr(request, "bound_account", None),
         existing_chat_id=getattr(request, "upstream_chat_id", None),
+        exclude_account_emails=getattr(request, "excluded_account_emails", None),
     ):
         if item.get("type") == "meta":
             chat_id = item.get("chat_id")
@@ -818,6 +821,15 @@ def request_max_attempts(request: StandardRequest) -> int:
     return 4 if request.tools else settings.MAX_RETRIES
 
 
+def empty_upstream_response_reason(state: RuntimeAttemptState) -> str | None:
+    """Return a retry/error reason when upstream ended successfully but produced no usable output."""
+    answer_text = state.answer_text.strip()
+    reasoning_text = state.reasoning_text.strip()
+    if answer_text or state.tool_calls or state.finish_reason != "stop":
+        return None
+    return "reasoning_only_upstream_response" if reasoning_text else "empty_upstream_response"
+
+
 def plan_runtime_attempts(request: StandardRequest, *, initial_prompt: str) -> RuntimeAttemptPlan:
     loop = build_retry_loop(request, initial_prompt=initial_prompt)
     return RuntimeAttemptPlan(loop=loop, prompt=loop.prompt)
@@ -1012,18 +1024,9 @@ def evaluate_retry_directive(
     # 2) 只返回了 thinking/reasoning，但没有最终 answer。
     # 这两种情况对 OpenAI 兼容层都会变成 message.content=""，容易让 agent 中断。
     # 允许在“只有 reasoning、没有最终正文”时继续自动重试，而不是把空结果当成功。
-    answer_text = state.answer_text.strip()
-    reasoning_text = state.reasoning_text.strip()
-    if (
-        not answer_text
-        and not state.tool_calls
-        and state.finish_reason == "stop"
-        and can_retry_after_output
-    ):
-        return _retry(
-            "reasoning_only_upstream_response" if reasoning_text else "empty_upstream_response",
-            current_prompt,  # prompt 不变，让上游重新处理
-        )
+    empty_reason = empty_upstream_response_reason(state)
+    if empty_reason and can_retry_after_output:
+        return _retry(empty_reason, current_prompt)  # prompt 不变，让上游重新处理
 
     return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason=None)
 

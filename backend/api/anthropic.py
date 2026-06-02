@@ -15,6 +15,7 @@ from backend.runtime.execution import (
     cleanup_runtime_resources,
     collect_completion_run,
     collect_completion_run_with_recovery,
+    empty_upstream_response_reason,
     evaluate_retry_directive,
     request_max_attempts,
 )
@@ -187,6 +188,26 @@ async def _reacquire_bound_account_if_needed(*, client: QwenClient, standard_req
         standard_request.bound_account = None
 
 
+def _exclude_attempt_account_for_empty_retry(*, standard_request: StandardRequest, execution, reason: str | None) -> None:
+    if reason not in {"empty_upstream_response", "reasoning_only_upstream_response"}:
+        return
+    if getattr(standard_request, "upstream_files", None) or getattr(standard_request, "upstream_chat_id", None):
+        return
+    email = getattr(getattr(execution, "acc", None), "email", None)
+    if not email:
+        return
+    excluded = getattr(standard_request, "excluded_account_emails", None)
+    if excluded is None:
+        excluded = []
+        standard_request.excluded_account_emails = excluded
+    if email not in excluded:
+        excluded.append(email)
+    if getattr(standard_request, "bound_account_email", None) == email:
+        standard_request.bound_account_email = None
+    if getattr(getattr(standard_request, "bound_account", None), "email", None) == email:
+        standard_request.bound_account = None
+
+
 @router.post("/messages/count_tokens")
 @router.post("/v1/messages/count_tokens")
 @router.post("/anthropic/v1/messages/count_tokens")
@@ -340,6 +361,11 @@ async def anthropic_messages(request: Request):
                                 allow_after_visible_output=True,
                             )
                             if retry.retry:
+                                _exclude_attempt_account_for_empty_retry(
+                                    standard_request=standard_request,
+                                    execution=execution,
+                                    reason=retry.reason,
+                                )
                                 reused_persistent_chat = bool(standard_request.persistent_session and standard_request.upstream_chat_id)
                                 # 如果正在复用会话，重试时保留会话，避免删除后重建导致上下文丢失
                                 preserve_chat = reused_persistent_chat
@@ -353,6 +379,19 @@ async def anthropic_messages(request: Request):
                                     current_prompt = retry.next_prompt
                                 await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
                                 continue
+
+                            empty_reason = empty_upstream_response_reason(execution.state)
+                            if empty_reason:
+                                await cleanup_runtime_resources(
+                                    client,
+                                    execution.acc,
+                                    execution.chat_id,
+                                    preserve_chat=bool(standard_request.persistent_session),
+                                )
+                                raise RuntimeError(
+                                    f"Upstream returned an empty response after {stream_attempt + 1}/{max_attempts} attempts "
+                                    f"({empty_reason}). Please retry later or check upstream account/model health."
+                                )
 
                             if not stream_state.pending_chunks:
                                 stream_state.pending_chunks.append(_message_start_event(msg_id, model_name, current_prompt, execution.state.answer_text))
@@ -451,6 +490,11 @@ async def anthropic_messages(request: Request):
                         max_attempts=max_attempts,
                     )
                     if retry.retry:
+                        _exclude_attempt_account_for_empty_retry(
+                            standard_request=standard_request,
+                            execution=execution,
+                            reason=retry.reason,
+                        )
                         reused_persistent_chat = bool(standard_request.persistent_session and standard_request.upstream_chat_id)
                         # 如果正在复用会话，重试时保留会话，避免删除后重建导致上下文丢失
                         preserve_chat = reused_persistent_chat
@@ -464,6 +508,19 @@ async def anthropic_messages(request: Request):
                             current_prompt = retry.next_prompt
                         await _reacquire_bound_account_if_needed(client=client, standard_request=standard_request)
                         continue
+
+                    empty_reason = empty_upstream_response_reason(execution.state)
+                    if empty_reason:
+                        await cleanup_runtime_resources(
+                            client,
+                            execution.acc,
+                            execution.chat_id,
+                            preserve_chat=bool(standard_request.persistent_session),
+                        )
+                        raise RuntimeError(
+                            f"Upstream returned an empty response after {stream_attempt + 1}/{max_attempts} attempts "
+                            f"({empty_reason}). Please retry later or check upstream account/model health."
+                        )
 
                     directive = build_tool_directive(standard_request, execution.state)
                     content_blocks: list[dict] = []
