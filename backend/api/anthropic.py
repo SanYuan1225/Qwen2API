@@ -454,6 +454,13 @@ async def anthropic_messages(request: Request):
                                 execution.chat_id,
                                 preserve_chat=bool(standard_request.persistent_session),
                             )
+                            # Ensure the initial message_start chunk carries final usage (output_tokens)
+                            final_usage = _anthropic_usage(current_prompt, execution.state.answer_text)
+                            for i, chunk in enumerate(stream_state.pending_chunks):
+                                if isinstance(chunk, str) and chunk.startswith("event: message_start"):
+                                    stream_state.pending_chunks[i] = stream_presenter.anthropic_message_start(msg_id, model_name, final_usage)
+                                    break
+
                             for chunk in stream_state.pending_chunks:
                                 yield chunk
                             return
