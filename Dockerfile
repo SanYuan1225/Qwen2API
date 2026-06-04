@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # Stage 1: Build frontend assets once on the build platform.
-FROM --platform=$BUILDPLATFORM node:20-bookworm-slim AS frontend-builder
+FROM --platform=$BUILDPLATFORM  docker.1ms.run/library/node:20-bookworm-slim AS frontend-builder
 WORKDIR /app
 COPY frontend/package*.json ./
 # Prefer deterministic install; fall back to npm install when lockfile is out of sync
